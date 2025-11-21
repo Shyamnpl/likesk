@@ -68,15 +68,21 @@ def get_today_midnight_timestamp():
     return midnight.timestamp()
 
 def load_tokens(server_name):
-    if server_name == "IND":
-        with open("token_ind.json", "r") as f:
-            return json.load(f)
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        with open("token_br.json", "r") as f:
-            return json.load(f)
-    else:
-        with open("token_bd.json", "r") as f:
-            return json.load(f)
+    try:
+        if server_name == "IND":
+            with open("token_ind.json", "r") as f:
+                return json.load(f)
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            # NOTE: token_br.json file is missing in your project
+            with open("token_br.json", "r") as f:
+                return json.load(f)
+        else:
+            with open("token_bd.json", "r") as f:
+                return json.load(f)
+    except FileNotFoundError:
+        return None # Return None if a token file is missing
+    except json.JSONDecodeError:
+        return None # Return None if JSON is invalid
 
 def encrypt_message(plaintext):
     key = b'Yg&tc%DEuh6%Zc^8'
@@ -106,8 +112,13 @@ async def send_request(encrypted_uid, token, url):
         'ReleaseVersion': "OB50"
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=edata, headers=headers) as response:
-            return response.status
+        try:
+            async with session.post(url, data=edata, headers=headers, timeout=5) as response:
+                return response.status
+        except asyncio.TimeoutError:
+            return 504  # Gateway Timeout
+        except Exception:
+            return 500  # Internal Server Error
 
 async def send_multiple_requests(uid, server_name, url):
     region = server_name
@@ -116,11 +127,12 @@ async def send_multiple_requests(uid, server_name, url):
     tasks = []
     tokens = load_tokens(server_name)
     
-    # --- MODIFICATION: Use all tokens from the loaded file ---
+    if not tokens:
+        return [] # Return empty if no tokens loaded
+
     for token_obj in tokens:
         token = token_obj["token"]
         tasks.append(send_request(encrypted_uid, token, url))
-    # --- END MODIFICATION ---
     
     results = await asyncio.gather(*tasks)
     return results
@@ -156,11 +168,18 @@ def make_request(encrypt, server_name, token):
         'X-GA': "v1 1",
         'ReleaseVersion': "OB50"
     }
-
-    response = requests.post(url, data=edata, headers=headers, verify=False)
-    hex_data = response.content.hex()
-    binary = bytes.fromhex(hex_data)
-    return decode_protobuf(binary)
+    try:
+        # Added verify=False and timeout
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
+        if response.status_code != 200:
+             print(f"Error from server: {response.status_code}")
+             return None
+        hex_data = response.content.hex()
+        binary = bytes.fromhex(hex_data)
+        return decode_protobuf(binary)
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
+        return None
 
 def decode_protobuf(binary):
     try:
@@ -168,6 +187,7 @@ def decode_protobuf(binary):
         items.ParseFromString(binary)
         return items
     except Exception as e:
+        # [span_0](start_span)This is the error you were seeing in the logs[span_0](end_span)
         print(f"Error decoding Protobuf data: {e}")
         return None
 
@@ -177,7 +197,6 @@ def handle_requests():
     server_name = request.args.get("server_name", "").upper()
     key = request.args.get("key")
 
-    # --- MODIFICATION: New API Key Logic ---
     if key == "BD8014275586":
         if uid != "8014275586":
             return jsonify({"error": "This API key is only valid for UID 8014275586."}), 403
@@ -185,26 +204,32 @@ def handle_requests():
              return jsonify({"error": "This API key is only valid for server_name 'BD'."}), 403
     elif key != "gst":
         return jsonify({"error": "Invalid or missing API key 🔑"}), 403
-    # --- END MODIFICATION ---
 
     if not uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
 
     def process_request():
         data = load_tokens(server_name)
-        # Use the first token just for getting player info
+        
+        # --- MODIFICATION: Check if token files exist and are valid ---
+        if data is None or len(data) == 0:
+            if server_name == "IND":
+                filename = "token_ind.json"
+            elif server_name in {"BR", "US", "SAC", "NA"}:
+                filename = "token_br.json"
+            else:
+                filename = "token_bd.json"
+            return {"error": f"Could not load tokens. '{filename}' is missing or empty/invalid.", "status": 500}
+        
         info_token = data[0]['token']
         encrypt = enc(uid)
 
         today_midnight = get_today_midnight_timestamp()
-        
-        # --- MODIFICATION: Use API key (key) for rate tracking instead of first token ---
         count, last_reset = token_tracker[key]
 
         if last_reset < today_midnight:
             token_tracker[key] = [0, time.time()]
             count = 0
-        # --- END MODIFICATION ---
 
         if count >= KEY_LIMIT:
             return {
@@ -214,15 +239,21 @@ def handle_requests():
             }
 
         before = make_request(encrypt, server_name, info_token)
-        jsone = MessageToJson(before)
-        data = json.loads(jsone)
-        
-        # --- ADDED: Error handling if player info fails ---
-        if 'AccountInfo' not in data:
-             return {"error": f"Could not find player info for UID {uid} on server {server_name}. Check if UID and server are correct.", "status": 404}
-        # --- END ADDED ---
 
-        before_like = int(data['AccountInfo'].get('Likes', 0))
+        # --- MODIFICATION: Add check for None to prevent crash ---
+        if before is None:
+            return {
+                "error": "Could not fetch player info BEFORE sending likes. The first token in your token list is likely invalid or expired. Please update your token file.",
+                "status": 500
+            }
+        
+        jsone = MessageToJson(before)
+        data_json = json.loads(jsone)
+        
+        if 'AccountInfo' not in data_json:
+             return {"error": f"Could not find player info for UID {uid} on server {server_name}. Check if UID and server are correct.", "status": 404}
+        
+        before_like = int(data_json['AccountInfo'].get('Likes', 0))
 
         # Select URL
         if server_name == "IND":
@@ -235,21 +266,27 @@ def handle_requests():
         asyncio.run(send_multiple_requests(uid, server_name, url))
 
         after = make_request(encrypt, server_name, info_token)
-        jsone = MessageToJson(after)
-        data = json.loads(jsone)
+        
+        # --- MODIFICATION: Add check for None to prevent crash ---
+        if after is None:
+            return {
+                "error": "Could not fetch player info AFTER sending likes. The first token in your token list is likely invalid or expired. Likes were sent, but result cannot be shown.",
+                "status": 500
+            }
 
-        after_like = int(data['AccountInfo']['Likes'])
-        id = int(data['AccountInfo']['UID'])
-        name = str(data['AccountInfo']['PlayerNickname'])
+        jsone_after = MessageToJson(after)
+        data_after = json.loads(jsone_after)
+
+        after_like = int(data_after['AccountInfo']['Likes'])
+        id = int(data_after['AccountInfo']['UID'])
+        name = str(data_after['AccountInfo']['PlayerNickname'])
 
         like_given = after_like - before_like
         status = 1 if like_given > 0 else 2
 
         if like_given > 0:
-            # --- MODIFICATION: Use API key (key) for rate tracking ---
             token_tracker[key][0] += 1
             count += 1
-            # --- END MODIFICATION ---
 
         remains = KEY_LIMIT - count
 
@@ -265,7 +302,15 @@ def handle_requests():
         return result
 
     result = process_request()
-    return jsonify(result)
+    
+    # Set status code for errors
+    status_code = 200
+    if 'status' in result and isinstance(result['status'], int):
+        status_code = result['status']
+    elif 'error' in result:
+        status_code = 500
+
+    return jsonify(result), status_code
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False)
