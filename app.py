@@ -52,9 +52,11 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
-#FUCKED BY JOBAYAR AHMED @JOBAYAR_AHMED
-#DONT CHANGE CREDIT 
-#IF YOU CHANGE MY CREDIT, I'LL FUCK YOUR MOM
+# --- SOLUTION: Suppress InsecureRequestWarning from logs ---
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- END SOLUTION ---
+
 
 app = Flask(__name__)
 
@@ -70,18 +72,20 @@ def get_today_midnight_timestamp():
 def load_tokens(server_name):
     try:
         if server_name == "IND":
-            with open("token_ind.json", "r") as f:
-                return json.load(f)
+            filename = "token_ind.json"
         elif server_name in {"BR", "US", "SAC", "NA"}:
-            # NOTE: token_br.json file is missing in your project
-            with open("token_br.json", "r") as f:
-                return json.load(f)
+            filename = "token_br.json"
         else:
-            with open("token_bd.json", "r") as f:
-                return json.load(f)
+            filename = "token_bd.json"
+        
+        with open(filename, "r") as f:
+            return json.load(f)
+            
     except FileNotFoundError:
+        print(f"Error: Token file '{filename}' not found.")
         return None # Return None if a token file is missing
     except json.JSONDecodeError:
+        print(f"Error: Token file '{filename}' is not valid JSON.")
         return None # Return None if JSON is invalid
 
 def encrypt_message(plaintext):
@@ -172,13 +176,13 @@ def make_request(encrypt, server_name, token):
         # Added verify=False and timeout
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
         if response.status_code != 200:
-             print(f"Error from server: {response.status_code}")
+             print(f"Info fetch failed for token...{token[-10:]}: Status {response.status_code}")
              return None
         hex_data = response.content.hex()
         binary = bytes.fromhex(hex_data)
         return decode_protobuf(binary)
     except requests.exceptions.RequestException as e:
-        print(f"Request failed: {e}")
+        print(f"Request failed for token...{token[-10:]}: {e}")
         return None
 
 def decode_protobuf(binary):
@@ -187,7 +191,7 @@ def decode_protobuf(binary):
         items.ParseFromString(binary)
         return items
     except Exception as e:
-        # [span_0](start_span)This is the error you were seeing in the logs[span_0](end_span)
+        # This is the error you were seeing in the logs
         print(f"Error decoding Protobuf data: {e}")
         return None
 
@@ -211,7 +215,6 @@ def handle_requests():
     def process_request():
         data = load_tokens(server_name)
         
-        # --- MODIFICATION: Check if token files exist and are valid ---
         if data is None or len(data) == 0:
             if server_name == "IND":
                 filename = "token_ind.json"
@@ -221,9 +224,7 @@ def handle_requests():
                 filename = "token_bd.json"
             return {"error": f"Could not load tokens. '{filename}' is missing or empty/invalid.", "status": 500}
         
-        info_token = data[0]['token']
         encrypt = enc(uid)
-
         today_midnight = get_today_midnight_timestamp()
         count, last_reset = token_tracker[key]
 
@@ -238,14 +239,26 @@ def handle_requests():
                 "remains": f"(0/{KEY_LIMIT})"
             }
 
-        before = make_request(encrypt, server_name, info_token)
+        # --- SOLUTION: Try all tokens until one works for info fetch ---
+        before = None
+        info_token = None # Will store the token that *worked*
 
-        # --- MODIFICATION: Add check for None to prevent crash ---
+        print("Finding a working token to fetch info...")
+        for token_obj in data:
+            temp_token = token_obj['token']
+            before = make_request(encrypt, server_name, temp_token)
+            if before is not None:
+                info_token = temp_token # We found a working token!
+                print(f"Successfully fetched info with token ...{info_token[-10:]}")
+                break # Stop looping
+
         if before is None:
+            # If 'before' is still None after trying all tokens...
             return {
-                "error": "Could not fetch player info BEFORE sending likes. The first token in your token list is likely invalid or expired. Please update your token file.",
+                "error": "Could not fetch player info BEFORE sending likes. All tokens in your token file might be invalid, expired, or blocked from fetching info.",
                 "status": 500
             }
+        # --- END SOLUTION ---
         
         jsone = MessageToJson(before)
         data_json = json.loads(jsone)
@@ -263,19 +276,26 @@ def handle_requests():
         else:
             url = "https://clientbp.ggblueshark.com/LikeProfile"
 
+        print(f"Sending likes with all {len(data)} tokens...")
         asyncio.run(send_multiple_requests(uid, server_name, url))
+        print("Like requests finished. Fetching 'after' count...")
 
-        after = make_request(encrypt, server_name, info_token)
+        # Use the *same* token that worked before to fetch 'after' count
+        after = make_request(encrypt, server_name, info_token) 
         
-        # --- MODIFICATION: Add check for None to prevent crash ---
         if after is None:
+            # This is unlikely if it just worked, but good to check
             return {
-                "error": "Could not fetch player info AFTER sending likes. The first token in your token list is likely invalid or expired. Likes were sent, but result cannot be shown.",
+                "error": f"Could not fetch player info AFTER sending likes. The token ...{info_token[-10:]} may have expired mid-request. Likes were sent, but result cannot be calculated.",
                 "status": 500
             }
 
         jsone_after = MessageToJson(after)
         data_after = json.loads(jsone_after)
+
+        # Handle case where AccountInfo might be missing in 'after' (less likely)
+        if 'AccountInfo' not in data_after:
+             return {"error": "Failed to parse player info after sending likes.", "status": 500}
 
         after_like = int(data_after['AccountInfo']['Likes'])
         id = int(data_after['AccountInfo']['UID'])
@@ -305,10 +325,16 @@ def handle_requests():
     
     # Set status code for errors
     status_code = 200
-    if 'status' in result and isinstance(result['status'], int):
-        status_code = result['status']
+    if 'status' in result:
+        # Check if 'status' is an integer and a valid HTTP status code
+        try:
+            status_code = int(result['status'])
+            if not 100 <= status_code <= 599:
+                status_code = 200 # Default to 200 if status is not a valid HTTP code (like '1' or '2')
+        except (ValueError, TypeError):
+             status_code = 200 # Default to 200 if status is not an integer
     elif 'error' in result:
-        status_code = 500
+        status_code = 500 # Default to 500 for generic errors
 
     return jsonify(result), status_code
 
