@@ -64,6 +64,13 @@ app = Flask(__name__)
 KEY_LIMIT = 150
 token_tracker = defaultdict(lambda: [0, time.time()])  # api_key: [count, last_reset_time]
 
+# --- SOLUTION: Batch Processing Setup ---
+# Yeh Vercel timeout (10s) ko rokne ke liye har request mein sirf 50 token istemaal karega
+BATCH_SIZE = 50 
+# Yeh track karega ki humne kaun se tokens istemaal kar liye hain
+used_token_indices = defaultdict(lambda: -1)
+# --- END SOLUTION ---
+
 def get_today_midnight_timestamp():
     now = datetime.now()
     midnight = datetime(now.year, now.month, now.day)
@@ -125,6 +132,7 @@ async def send_request(encrypted_uid, token, url):
             return 500  # Internal Server Error
 
 async def send_multiple_requests(uid, server_name, url):
+    global used_token_indices
     region = server_name
     protobuf_message = create_protobuf_message(uid, region)
     encrypted_uid = encrypt_message(protobuf_message)
@@ -134,9 +142,31 @@ async def send_multiple_requests(uid, server_name, url):
     if not tokens:
         return [] # Return empty if no tokens loaded
 
-    for token_obj in tokens:
+    # --- SOLUTION: Batch Processing Logic ---
+    # Pichhla index load karein
+    last_index = used_token_indices[server_name]
+    
+    # Naya batch select karein
+    start_index = (last_index + 1) % len(tokens)
+    end_index = (start_index + BATCH_SIZE)
+    
+    token_batch = []
+    if end_index > len(tokens):
+        # Agar batch list ke ant tak pahunch jaata hai, toh split karein
+        token_batch.extend(tokens[start_index:]) # Ant tak
+        token_batch.extend(tokens[:(end_index % len(tokens))]) # Shuru se baaki
+        used_token_indices[server_name] = (end_index % len(tokens)) - 1 # Naya last index save karein
+    else:
+        # Normal batch
+        token_batch = tokens[start_index:end_index]
+        used_token_indices[server_name] = end_index - 1 # Naya last index save karein
+
+    print(f"Using {len(token_batch)} tokens from index {start_index} to {used_token_indices[server_name]}...")
+    
+    for token_obj in token_batch:
         token = token_obj["token"]
         tasks.append(send_request(encrypted_uid, token, url))
+    # --- END SOLUTION ---
     
     results = await asyncio.gather(*tasks)
     return results
@@ -173,7 +203,6 @@ def make_request(encrypt, server_name, token):
         'ReleaseVersion': "OB50"
     }
     try:
-        # Added verify=False and timeout
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
         if response.status_code != 200:
              print(f"Info fetch failed for token...{token[-10:]}: Status {response.status_code}")
@@ -191,7 +220,6 @@ def decode_protobuf(binary):
         items.ParseFromString(binary)
         return items
     except Exception as e:
-        # This is the error you were seeing in the logs
         print(f"Error decoding Protobuf data: {e}")
         return None
 
@@ -230,6 +258,10 @@ def handle_requests():
 
         if last_reset < today_midnight:
             token_tracker[key] = [0, time.time()]
+            # --- SOLUTION: Reset batch index daily ---
+            global used_token_indices
+            used_token_indices.clear()
+            # --- END SOLUTION ---
             count = 0
 
         if count >= KEY_LIMIT:
@@ -253,7 +285,6 @@ def handle_requests():
                 break # Stop looping
 
         if before is None:
-            # If 'before' is still None after trying all tokens...
             return {
                 "error": "Could not fetch player info BEFORE sending likes. All tokens in your token file might be invalid, expired, or blocked from fetching info.",
                 "status": 500
@@ -268,7 +299,6 @@ def handle_requests():
         
         before_like = int(data_json['AccountInfo'].get('Likes', 0))
 
-        # Select URL
         if server_name == "IND":
             url = "https://client.ind.freefiremobile.com/LikeProfile"
         elif server_name in {"BR", "US", "SAC", "NA"}:
@@ -276,7 +306,7 @@ def handle_requests():
         else:
             url = "https://clientbp.ggblueshark.com/LikeProfile"
 
-        print(f"Sending likes with all {len(data)} tokens...")
+        print(f"Sending likes with a batch of {BATCH_SIZE} tokens...")
         asyncio.run(send_multiple_requests(uid, server_name, url))
         print("Like requests finished. Fetching 'after' count...")
 
@@ -284,7 +314,6 @@ def handle_requests():
         after = make_request(encrypt, server_name, info_token) 
         
         if after is None:
-            # This is unlikely if it just worked, but good to check
             return {
                 "error": f"Could not fetch player info AFTER sending likes. The token ...{info_token[-10:]} may have expired mid-request. Likes were sent, but result cannot be calculated.",
                 "status": 500
@@ -293,7 +322,6 @@ def handle_requests():
         jsone_after = MessageToJson(after)
         data_after = json.loads(jsone_after)
 
-        # Handle case where AccountInfo might be missing in 'after' (less likely)
         if 'AccountInfo' not in data_after:
              return {"error": "Failed to parse player info after sending likes.", "status": 500}
 
@@ -323,18 +351,16 @@ def handle_requests():
 
     result = process_request()
     
-    # Set status code for errors
     status_code = 200
     if 'status' in result:
-        # Check if 'status' is an integer and a valid HTTP status code
         try:
             status_code = int(result['status'])
             if not 100 <= status_code <= 599:
-                status_code = 200 # Default to 200 if status is not a valid HTTP code (like '1' or '2')
+                status_code = 200 
         except (ValueError, TypeError):
-             status_code = 200 # Default to 200 if status is not an integer
+             status_code = 200 
     elif 'error' in result:
-        status_code = 500 # Default to 500 for generic errors
+        status_code = 500 
 
     return jsonify(result), status_code
 
